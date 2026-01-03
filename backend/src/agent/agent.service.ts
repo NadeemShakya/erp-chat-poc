@@ -9,33 +9,25 @@ import { AnswerSchema, type AnswerOutput } from 'src/ai/schemas';
 import { SqlService } from 'sql/sql.service';
 import { RagService } from 'rag/rag.service';
 
-const PlanSchema = z.object({
-  steps: z
-    .array(
-      z.object({
-        tool: z.enum(['sql', 'rag']),
-        input: z.string().min(1),
-        why: z.string().optional(),
-      }),
-    )
-    .min(1)
-    .max(6),
-});
-
-type PlanOutput = z.infer<typeof PlanSchema>;
+// (Keep your existing PlanSchema if you want, but we won't use it in this mode)
 
 // Filter schema: only return ids of chunks that actually support the answer
 const FilterSchema = z.object({
   keep_chunk_ids: z.array(z.number()).max(8).default([]),
 });
-
 type FilterOutput = z.infer<typeof FilterSchema>;
+
+// ✅ NEW: rewrite schema for RAG query
+const RagQuerySchema = z.object({
+  rag_query: z.string().min(1),
+});
+type RagQueryOutput = z.infer<typeof RagQuerySchema>;
 
 @Injectable()
 export class AgentService {
   constructor(
     private readonly lc: LangchainService,
-    private readonly sql: SqlService,
+    private readonly sql: SqlService, // unused for now, ok to keep
     private readonly rag: RagService,
   ) {}
 
@@ -58,34 +50,31 @@ export class AgentService {
     }
   }
 
-  private planPrompt() {
-    // NOTE: avoid `{` `}` examples unless escaped as `{{` `}}` because PromptTemplate uses f-string style.
+  // ✅ NEW: RAG rewrite prompt (f-string safe: no unescaped { } examples)
+  private rewritePrompt() {
     return new PromptTemplate({
       template: `
-You are an ERP assistant. You can use TWO tools, executed by the system:
-- sql: for exact counts/lists/filters/aggregations (READ ONLY)
-- rag: for fuzzy/semantic lookup on embedded Product/Material documents
+You are rewriting a user question into a compact search query for hybrid RAG over Product documents.
 
-CRITICAL DB RULES:
-- Products table: products
-- Product code column: products.code
-- Materials table: materials
-- Material code: materials.material_id
-- IDs are UUIDs. If user gives something like "PN-xxxx" it's likely products.code, not products.id.
-- Product attributes are in product_attributes joined with attribute_types on pa.attribute_id = at.id.
+The RAG index includes ALL product fields ingested into raw_text, including:
+- product name
+- product code
+- barcode
+- product type
+- description
+- attributes (attribute name + value + unit)
 
-SQL RULES:
-- Output ONE statement only.
-- Only SELECT/WITH.
-- Always filter deleted rows: where <table>.deleted_at is null
+Rewrite rules:
+- Output a short keyword/spec query (not a sentence).
+- Include key entity/type words (e.g. transformer, insulation material).
+- If a numeric/unit value appears, include common variants:
+  - 11kV -> "11kV" OR "11 kV" OR "11 kilovolt" OR "11000 V"
+  - 200 Hz -> "200 Hz" OR "200Hz" OR "200 Hertz"
+- If the user implies an attribute, add likely attribute label words:
+  - "11kV transformer" -> include "Primary Voltage" and "Voltage"
+  - "frequency 200" -> include "Frequency"
 
-TASK:
-Given the user question, output a plan of 1 to 3 steps.
-Use sql when you need exact numbers/lists.
-Use rag when you need fuzzy match / descriptions / finding entity IDs by name/code.
-
-IMPORTANT OUTPUT RULES:
-- Return ONLY valid JSON for this schema (no markdown, no code fences, no extra keys):
+Return ONLY valid JSON matching this schema:
 {format_instructions}
 
 User question:
@@ -159,46 +148,32 @@ Return ONLY JSON in this schema:
   async run(message: string): Promise<AnswerOutput> {
     const llm = this.lc.model;
 
-    // 1) PLAN
-    const planParser = StructuredOutputParser.fromZodSchema(PlanSchema);
-    const planChain = RunnableSequence.from([
-      this.planPrompt(),
-      llm,
-      planParser,
-    ]);
+    // 1) ✅ REWRITE query for RAG (with safe fallback)
+    let ragQuery = message;
+    try {
+      const rewriteParser =
+        StructuredOutputParser.fromZodSchema(RagQuerySchema);
+      const rewriteChain = RunnableSequence.from([
+        this.rewritePrompt(),
+        llm,
+        rewriteParser,
+      ]);
 
-    const plan: PlanOutput = await planChain.invoke({
-      question: message,
-      format_instructions: planParser.getFormatInstructions(),
-    });
+      const rewritten: RagQueryOutput = await rewriteChain.invoke({
+        question: message,
+        format_instructions: rewriteParser.getFormatInstructions(),
+      });
 
-    // 2) EXECUTE
-    let sqlResult: any[] = [];
-    let matches: any[] = [];
-
-    console.log('Agent plan:', plan);
-
-    for (const step of plan.steps) {
-      if (step.tool === 'sql') {
-        try {
-          const res = await this.sql.query(step.input);
-          sqlResult = res.rows ?? [];
-        } catch (e: any) {
-          sqlResult = [
-            {
-              sql_error: String(e?.message ?? e),
-              attempted_sql: step.input,
-            },
-          ];
-        }
-      }
-
-      if (step.tool === 'rag') {
-        matches = await this.rag.search(step.input, 10);
-      }
+      ragQuery = rewritten?.rag_query?.trim() || message;
+    } catch (e) {
+      // fallback to raw user message
+      ragQuery = message;
     }
 
-    // 2.5) FILTER the matches to only relevant chunks
+    // 2) ALWAYS RAG with the rewritten query
+    const matches = await this.rag.search(ragQuery, 10);
+
+    // 3) FILTER the matches
     let filteredMatches = matches;
 
     if (matches?.length) {
@@ -218,11 +193,10 @@ Return ONLY JSON in this schema:
       const keep = new Set<number>((filter.keep_chunk_ids ?? []).map(Number));
       filteredMatches = matches.filter((m) => keep.has(Number(m.chunk_id)));
 
-      // Safety fallback: if the filter keeps nothing, keep top 1
       if (!filteredMatches.length) filteredMatches = matches.slice(0, 1);
     }
 
-    // 3) FINAL ANSWER (strict JSON)
+    // 4) FINAL ANSWER
     const answerParser = StructuredOutputParser.fromZodSchema(AnswerSchema);
     const answerChain = RunnableSequence.from([
       this.finalAnswerPrompt(),
@@ -232,7 +206,7 @@ Return ONLY JSON in this schema:
 
     const final = await answerChain.invoke({
       question: message,
-      sql_result: this.safeJsonStringify(sqlResult),
+      sql_result: this.safeJsonStringify([]), // no SQL in this mode
       sources: this.buildSourcesText(filteredMatches),
       format_instructions: answerParser.getFormatInstructions(),
     });
