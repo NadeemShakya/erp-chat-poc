@@ -152,7 +152,7 @@ Return JSON:
     });
   }
 
-  private finalAnswerPrompt() {
+  private finalAnswerPromptV1() {
     return new PromptTemplate({
       template: `
 You are an ERP assistant.
@@ -271,6 +271,143 @@ Return ONLY JSON in this schema:
     });
   }
 
+  /**
+   * V2: same rules, but slightly more user-friendly and conservative.
+   * - If broad/list query has matches, show examples (don’t just say “Yes”)
+   * - If “No”, be stricter: only “No” if there is no direct match in SOURCES.
+   */
+  private finalAnswerPromptV2() {
+    return new PromptTemplate({
+      template: `
+You are an ERP assistant.
+
+Use ONLY SOURCES and SQL_RESULT.
+
+Follow the same classification + rules as V1, BUT:
+- For BROAD category or LIST requests: if there are matches in SOURCES, always show 2–5 examples.
+- Never answer "No" if any source contains a direct match for the requested Name/Code/Barcode.
+- If the user asks to list/show/find, do not begin with "Yes/No" — present results directly.
+
+Return ONLY valid JSON matching the schema.
+User question:
+<<<{question}>>>
+
+SQL_RESULT:
+<<<{sql_result}>>>
+
+SOURCES:
+<<<{sources}>>>
+
+Return ONLY JSON in this schema:
+{format_instructions}
+`,
+      inputVariables: [
+        'question',
+        'sql_result',
+        'sources',
+        'format_instructions',
+      ],
+    });
+  }
+
+  private extractDirectMatchSignals(question: string, sourcesText: string) {
+    // Very lightweight: detect if user gave a barcode/code/name-like token
+    const q = question.toLowerCase();
+
+    const codeLike = question
+      .match(/code\s*[:\-]?\s*([A-Za-z0-9:\/\-\s]+)$/i)?.[1]
+      ?.trim();
+    const barcodeLike = question
+      .match(/barcode\s*[:\-]?\s*([0-9A-Za-z\-]+)\b/i)?.[1]
+      ?.trim();
+
+    // If sources already contain the exact Code:/Barcode: line, then “No” is invalid.
+    const hasCodeInSources = codeLike
+      ? sourcesText.toLowerCase().includes(`code: ${codeLike.toLowerCase()}`)
+      : false;
+
+    const hasBarcodeInSources = barcodeLike
+      ? sourcesText
+          .toLowerCase()
+          .includes(`barcode: ${barcodeLike.toLowerCase()}`)
+      : false;
+
+    // Also detect direct Name: match if question is basically "Do we have X" (single entity)
+    // This stays intentionally conservative (won't overfire).
+    const possibleName =
+      question.match(/do we have\s+(.+?)\??$/i)?.[1]?.trim() ||
+      question.match(/have we built\s+(.+?)\??$/i)?.[1]?.trim() ||
+      question.match(/product named\s+(.+?)\??$/i)?.[1]?.trim();
+
+    const hasNameInSources = possibleName
+      ? sourcesText
+          .toLowerCase()
+          .includes(`name: ${possibleName.toLowerCase()}`)
+      : false;
+
+    return { hasCodeInSources, hasBarcodeInSources, hasNameInSources };
+  }
+
+  private scoreAnswer(params: {
+    out: any; // AnswerOutput
+    filteredMatches: any[];
+    sourcesText: string;
+    question: string;
+  }) {
+    const { out, filteredMatches, sourcesText, question } = params;
+
+    let score = 0;
+
+    // Must have basic fields
+    if (!out || typeof out.answer !== 'string') return -999;
+
+    // Grounded bonus
+    if (out.grounded === true) score += 3;
+    else score -= 1;
+
+    // Confidence sanity
+    const conf = typeof out.confidence === 'number' ? out.confidence : 0;
+    if (conf >= 0.9 && out.grounded !== true) score -= 2;
+    if (conf >= 0.7) score += 1;
+
+    // Citation alignment: citations must reference only returned matches
+    const matchIds = new Set(
+      (filteredMatches ?? []).map((m) => String(m.chunk_id)),
+    );
+    const citedIds = (out.citations ?? []).map((c: any) => String(c.chunk_id));
+    const invalidCites = citedIds.filter((id: string) => !matchIds.has(id));
+
+    if (invalidCites.length) score -= 5;
+    else if (citedIds.length) score += 1;
+
+    // “No” penalty if direct match exists in sources
+    const ansLower = out.answer.toLowerCase();
+    const saysNo =
+      ansLower.startsWith('no') || ansLower.includes('couldn’t find');
+    const signals = this.extractDirectMatchSignals(question, sourcesText);
+
+    if (
+      saysNo &&
+      (signals.hasCodeInSources ||
+        signals.hasBarcodeInSources ||
+        signals.hasNameInSources)
+    ) {
+      score -= 10; // hard fail: it contradicted evidence
+    }
+
+    // Prefer answers that actually mention the matched product name/code for specific queries
+    if (
+      !saysNo &&
+      (signals.hasCodeInSources ||
+        signals.hasBarcodeInSources ||
+        signals.hasNameInSources)
+    ) {
+      score += 1;
+    }
+
+    return score;
+  }
+
   async run(message: string): Promise<AnswerOutput> {
     const llm = this.lc.model;
 
@@ -326,31 +463,76 @@ Return ONLY JSON in this schema:
       }
     }
 
-    // 4) FINAL ANSWER
+    // 4) FINAL ANSWER (PDO duel)
     const answerParser = StructuredOutputParser.fromZodSchema(AnswerSchema);
-    const answerChain = RunnableSequence.from([
-      this.finalAnswerPrompt(),
+
+    const sourcesText = this.buildSourcesText(filteredMatches);
+    const sqlResultText = this.safeJsonStringify([]);
+
+    // Run both prompts
+    const chainV1 = RunnableSequence.from([
+      this.finalAnswerPromptV1(),
+      llm,
+      answerParser,
+    ]);
+    const chainV2 = RunnableSequence.from([
+      this.finalAnswerPromptV2(),
       llm,
       answerParser,
     ]);
 
-    const final = await answerChain.invoke({
+    const [out1, out2] = await Promise.all([
+      chainV1.invoke({
+        question: message,
+        sql_result: sqlResultText,
+        sources: sourcesText,
+        format_instructions: answerParser.getFormatInstructions(),
+      }),
+      chainV2.invoke({
+        question: message,
+        sql_result: sqlResultText,
+        sources: sourcesText,
+        format_instructions: answerParser.getFormatInstructions(),
+      }),
+    ]);
+
+    // Score and select winner
+    const score1 = this.scoreAnswer({
+      out: out1,
+      filteredMatches,
+      sourcesText,
       question: message,
-      sql_result: this.safeJsonStringify([]), // no SQL in this mode
-      sources: this.buildSourcesText(filteredMatches),
-      format_instructions: answerParser.getFormatInstructions(),
+    });
+    const score2 = this.scoreAnswer({
+      out: out2,
+      filteredMatches,
+      sourcesText,
+      question: message,
     });
 
-    // Only cite chunks we actually returned
+    const winner =
+      score2 > score1
+        ? { out: out2, version: 'v2', score: score2 }
+        : { out: out1, version: 'v1', score: score1 };
+
+    // Optional logging (helps debugging/observability)
+    console.log('PDO duel:', {
+      question: message,
+      score1,
+      score2,
+      winner: winner.version,
+    });
+
+    // Normalize citations to retrieved matches only
     const safeCitations = (filteredMatches ?? []).map((m) => ({
       chunk_id: m.chunk_id,
       title: m.title,
     }));
 
     return {
-      ...final,
+      ...winner.out,
       matches: filteredMatches,
-      citations: final.citations?.length ? safeCitations : [],
+      citations: winner.out.citations?.length ? safeCitations : [],
     };
   }
 }

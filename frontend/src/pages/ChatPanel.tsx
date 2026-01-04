@@ -1,24 +1,19 @@
 // src/pages/ChatPage.tsx
-import * as React from "react";
 import type { ChatMessage, ChatResponse } from "@/types/chat";
+import * as React from "react";
 
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { chatAsk, ingestProductsMaterials } from "@/lib/api";
-import { DevToolsPanel } from "@/components/dev/DevToolsPanel";
-
-const showDev =
-  String(import.meta.env.VITE_SHOW_DEV_TOOLS ?? "false").toLowerCase() ===
-  "true";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
+import { Textarea } from "@/components/ui/textarea";
+import { chatAsk } from "@/lib/api";
 
 const ERP_BASE =
   import.meta.env.VITE_ERP_BASE_URL ||
@@ -167,15 +162,12 @@ function DebugPanel({ r }: { r: ChatResponse }) {
 }
 
 export default function ChatPanel() {
-  const [ingesting, setIngesting] = React.useState(false);
-  const [ingestResult, setIngestResult] = React.useState<any>(null);
-  const [ingestError, setIngestError] = React.useState<string | null>(null);
   const [messages, setMessages] = React.useState<ChatMessage[]>(() => [
     {
       id: uid(),
       role: "assistant",
       content:
-        'Ask me about Products or Materials. Try: "How many products have Cooling Type ONAN?" or "Product with name Refresh Tears?"',
+        'Ask me about Products. Try: "Do we have a transformer for industrial applications, engineered for high reliability?" or "Look up for Transformer TX-1188"',
       createdAt: Date.now(),
     },
   ]);
@@ -188,35 +180,6 @@ export default function ChatPanel() {
   React.useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length, loading]);
-
-  async function onIngest() {
-    if (ingesting) return;
-    setIngestError(null);
-    setIngestResult(null);
-    setIngesting(true);
-    try {
-      const r = await ingestProductsMaterials({
-        tenantSchema: "tenant_power_electronics",
-        rebuild: true,
-      });
-      setIngestResult(r);
-
-      // Optional: add a system message into chat
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: uid(),
-          role: "assistant",
-          content: `✅ Ingestion complete. Products: ${r.source.products}, Materials: ${r.source.materials}.`,
-          createdAt: Date.now(),
-        },
-      ]);
-    } catch (e: any) {
-      setIngestError(e?.message ?? "Ingestion failed");
-    } finally {
-      setIngesting(false);
-    }
-  }
 
   async function onSend() {
     const text = input.trim();
@@ -286,7 +249,7 @@ export default function ChatPanel() {
         <CardHeader className="pb-3">
           <CardTitle className="text-lg">ERP Chat POC</CardTitle>
           <div className="text-sm text-muted-foreground">
-            RAG (Titan embeddings + pgvector) + Nova Lite (SQL + fuzzy)
+            RAG (Titan embeddings + pgvector)
           </div>
           <div className="text-xs text-muted-foreground">
             ERP links: <span className="font-mono">{ERP_BASE}</span>
