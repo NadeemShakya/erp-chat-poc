@@ -98,10 +98,6 @@ User question:
     });
   }
 
-  /**
-   * Filter prompt
-   * Small improvement: keep chunks that clearly represent a Product record and match by Name/Code/Type/Attribute.
-   */
   private filterPrompt() {
     return new PromptTemplate({
       template: `
@@ -113,12 +109,38 @@ Reject chunks that are unrelated, generic, or do not mention relevant properties
 
 Rules:
 - Keep at most 8 chunk_ids.
-- Prefer chunks that clearly contain a Product record:
-  - Contains "Entity: Product"
-  - And contains matching "Name:", "Code:", "Product Type:" or relevant attribute lines.
+- Return ONLY JSON matching the schema (no markdown, no extra keys).
 - Keep a chunk ONLY if it contains clear evidence relevant to the question.
-- Return ONLY JSON matching the schema.
-- No markdown, no code fences, no extra keys.
+
+EVIDENCE GATING (VERY IMPORTANT):
+
+1) If the user question is a USE-CASE / SUITABILITY query (contains words like "for", "suitable", "applications", "engineered", "reliability", "recommended"):
+   - Keep a chunk ONLY if at least one of these is true:
+     a) The chunk's Description line is NON-EMPTY and contains at least ONE key idea from the question (case-insensitive).
+     b) The chunk contains an Attributes line that matches a key idea from the question.
+     c) The Product Type clearly matches the implied need (e.g., transformer categories when user is asking about industrial power equipment).
+   - STRONG REJECTION:
+     If Description is empty AND Attributes is "- (none)" (or empty), reject the chunk unless it matches by exact Name/Code requested in the question.
+
+2) If the user asks for a SPECIFIC product by name/code/barcode:
+   - Keep only direct matches (Name:/Code: line match, case-insensitive).
+
+3) If the user asks a BROAD category (e.g. "Do we have Transformers?"):
+   - Keep chunks ONLY where the Name OR Product Type clearly contains that category word (case-insensitive).
+   - Do NOT keep chunks that do not mention the category in Name or Product Type.
+
+4) If the user asks to LIST / FIND / SHOW products with a constraint keyword/phrase X
+   (examples: "List me all the Control Panel products", "products with water-based exterior wall", "products with frequency 200"):
+   - Keep a chunk ONLY if the chunk contains the keyword/phrase X (case-insensitive) OR an obvious formatting variant,
+     somewhere in ONE of these places:
+     - Name:
+     - Code:
+     - Barcode:
+     - Product Type:
+     - Description:
+     - Attributes lines (the lines starting with "- ")
+   - STRONG REJECTION:
+     If the chunk does NOT mention X anywhere in those fields, it is NOT evidence and must be rejected.
 
 User question:
 <<<{question}>>>
@@ -146,11 +168,16 @@ You MUST use ONLY SOURCES and SQL_RESULT (SQL_RESULT is usually empty in this mo
 CLASSIFY THE QUESTION (pick exactly one):
 C) DETAIL request: the user asks for attributes/specs/details of a specific product
    (examples: "attributes", "specs", "specifications", "properties", "details", "what are the attributes", "provide me the attributes").
-A) SPECIFIC lookup: the user provides a specific product name/code/barcode and asks if it exists.
+D) LOOKUP / SHOW request: the user asks to retrieve or show a product record (NOT yes/no),
+   (examples: "look up", "lookup", "find", "search", "show me", "get me", "pull up", "fetch").
+A) SPECIFIC existence check: the user provides a specific product name/code/barcode and asks if it exists
+   (examples: "do we have", "is there", "have we built", "did we build", "exists").
 B) BROAD category: the user asks for a category/type (e.g. "Do we have Transformers?").
 
 PRIORITY:
 - If it looks like a DETAIL request, ALWAYS treat it as C even if the product name is specific.
+- Else if it looks like a LOOKUP / SHOW request, treat it as D (even if a code/name is provided).
+- Otherwise choose A or B.
 
 HOW TO ANSWER:
 
@@ -171,7 +198,24 @@ C) DETAIL REQUEST RULES (ATTRIBUTES/SPECS):
   - Then say you couldn't find a product record matching the requested name/code in SOURCES.
   - If there are close matches, list up to 3 (Name + Code + Type).
 
-A) SPECIFIC LOOKUP RULES:
+D) LOOKUP / SHOW REQUEST RULES (RETRIEVE A RECORD):
+- Identify the best matching Product record in SOURCES.
+  A direct match contains:
+  - "Entity: Product" AND
+  - "Name: <product name>" (case-insensitive), OR "Code: <code>" if user gave code.
+- If a direct match exists:
+  - Do NOT start with "Yes" or "No".
+  - Return the best match as a short record:
+    "<Name> (Code: <Code>) — Type: <Product Type>"
+  - Optionally include up to 2 extra helpful facts if present (e.g. Primary/Secondary Voltage, Rated Power), but keep concise.
+  - Citations must include ONLY the chunk(s) you referenced (usually 1).
+- If no direct match exists:
+  - Do NOT start with "Yes" or "No".
+  - Say: "I couldn’t find a product matching <X>."
+  - If there are close matches in SOURCES, say: "Closest matches I found:" and list up to 3 (Name + Code + Type).
+  - If unsure due to ambiguity, say "I don't know" and explain what is missing.
+
+A) SPECIFIC EXISTENCE CHECK RULES:
 - If SOURCES contains a Product record matching the user's name/code/barcode:
   - Answer must start with: "Yes —"
   - Then show the best match as a short record:
