@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { AgentService } from 'src/agent/agent.service';
-import { type AnswerOutput } from '../src/ai/schemas';
+import { AnswerOutput } from 'src/ai/schemas';
 
 @Injectable()
 export class ChatService {

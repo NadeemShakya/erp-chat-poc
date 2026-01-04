@@ -1,6 +1,6 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
-import { RagService } from 'rag/rag.service';
-import { SqlService } from 'sql/sql.service';
+import { RagService } from 'src/rag/rag.service';
+import { SqlService } from 'src/sql/sql.service';
 import { z } from 'zod';
 
 export function makeSqlTool(sql: SqlService) {

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
+import { assertReadOnlySql } from 'common/sql-guard';
 import { Pool } from 'pg';
-import { assertReadOnlySql } from '../common/sql-guard';
 
 @Injectable()
 export class SqlService {

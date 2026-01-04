@@ -1,5 +1,5 @@
 import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
-import { ChatService } from 'chat/chat.service';
+import { ChatService } from 'src/chat/chat.service';
 
 @Controller('eval')
 export class EvalController {

@@ -1,13 +1,12 @@
-import { Injectable } from '@nestjs/common';
+import { StructuredOutputParser } from '@langchain/core/output_parsers';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableSequence } from '@langchain/core/runnables';
-import { StructuredOutputParser } from '@langchain/core/output_parsers';
-import { z } from 'zod';
-
+import { Injectable } from '@nestjs/common';
 import { LangchainService } from 'src/ai/langchain.service';
 import { AnswerSchema, type AnswerOutput } from 'src/ai/schemas';
-import { SqlService } from 'sql/sql.service';
-import { RagService } from 'rag/rag.service';
+import { RagService } from 'src/rag/rag.service';
+import { SqlService } from 'src/sql/sql.service';
+import { z } from 'zod';
 
 // Filter schema: only return ids of chunks that actually support the answer
 const FilterSchema = z.object({
