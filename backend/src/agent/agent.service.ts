@@ -123,7 +123,7 @@ EVIDENCE GATING (VERY IMPORTANT):
      If Description is empty AND Attributes is "- (none)" (or empty), reject the chunk unless it matches by exact Name/Code requested in the question.
 
 2) If the user asks for a SPECIFIC product by name/code/barcode:
-   - Keep only direct matches (Name:/Code: line match, case-insensitive).
+   - Keep only direct matches (Name:/Code:/Barcode line match, case-insensitive).
 
 3) If the user asks a BROAD category (e.g. "Do we have Transformers?"):
    - Keep chunks ONLY where the Name OR Product Type clearly contains that category word (case-insensitive).
@@ -161,7 +161,7 @@ Return JSON:
 You are an ERP assistant.
 
 DEFINITION:
-- "Do we have X?" / "Have we built X?" means: "Does our ERP have Product records matching X (by name/code/type/attributes)?"
+- "Do we have X?" / "Have we built X?" means: "Does our ERP have Product records matching X (by name/code/barcode/type/attributes)?"
 
 You MUST use ONLY SOURCES and SQL_RESULT (SQL_RESULT is usually empty in this mode).
 
@@ -169,25 +169,35 @@ CLASSIFY THE QUESTION (pick exactly one):
 C) DETAIL request: the user asks for attributes/specs/details of a specific product
    (examples: "attributes", "specs", "specifications", "properties", "details", "what are the attributes", "provide me the attributes").
 D) LOOKUP / SHOW request: the user asks to retrieve or show a product record (NOT yes/no),
-   (examples: "look up", "lookup", "find", "search", "show me", "get me", "pull up", "fetch").
+   (examples: "look up", "lookup", "find", "search", "show me", "get me", "pull up", "fetch", "can you check on this").
 A) SPECIFIC existence check: the user provides a specific product name/code/barcode and asks if it exists
-   (examples: "do we have", "is there", "have we built", "did we build", "exists").
+   (examples: "do we have", "is there", "have we built", "did we build", "exists", "is this a product we have").
 B) BROAD category: the user asks for a category/type (e.g. "Do we have Transformers?").
 
 PRIORITY:
-- If it looks like a DETAIL request, ALWAYS treat it as C even if the product name is specific.
-- Else if it looks like a LOOKUP / SHOW request, treat it as D (even if a code/name is provided).
+- If it looks like a DETAIL request, ALWAYS treat it as C even if the product identifier is specific.
+- Else if it looks like a LOOKUP / SHOW request, treat it as D (even if a code/name/barcode is provided).
 - Otherwise choose A or B.
+
+MATCHING GUIDANCE (IMPORTANT):
+- Treat matches as case-insensitive.
+- A "direct match" is when a source contains "Entity: Product" AND one of:
+  - Name match: a line like "Name: <user name>"
+  - Code match: a line like "Code: <user code>"
+  - Barcode match: a line like "Barcode: <user barcode>"
+- If the user gives a product name, a chunk containing a line "Name: <that name>" is a direct match.
+- If the user gives a code, a chunk containing a line "Code: <that code>" is a direct match.
+- If the user gives a barcode, a chunk containing a line "Barcode: <that barcode>" is a direct match.
+- Never answer "No" or "I couldn’t find" when a direct match exists in SOURCES.
 
 HOW TO ANSWER:
 
 C) DETAIL REQUEST RULES (ATTRIBUTES/SPECS):
 - First, identify the best matching Product record in SOURCES.
-  A direct match contains:
-  - "Entity: Product" AND
-  - "Name: <product name>" (case-insensitive), OR "Code: <code>" if user gave code.
+- Prefer a direct match by Name/Code/Barcode.
 - If a direct match exists:
   - Answer must start with: "Here are the attributes for <Name> (Code: <Code>):"
+    - If Code is empty, omit "(Code: ...)".
   - Then list ALL attribute lines found under "Attributes:" exactly as they appear in the source.
     - Only list lines that start with "- " under the Attributes section.
   - If the Attributes section is "- (none)" or empty:
@@ -195,19 +205,18 @@ C) DETAIL REQUEST RULES (ATTRIBUTES/SPECS):
   - Citations must include ONLY the chunk(s) you used (usually 1).
 - If no direct match exists:
   - Answer must start with: "I don't know —"
-  - Then say you couldn't find a product record matching the requested name/code in SOURCES.
+  - Then say you couldn't find a product record matching the requested name/code/barcode in SOURCES.
   - If there are close matches, list up to 3 (Name + Code + Type).
 
 D) LOOKUP / SHOW REQUEST RULES (RETRIEVE A RECORD):
 - Identify the best matching Product record in SOURCES.
-  A direct match contains:
-  - "Entity: Product" AND
-  - "Name: <product name>" (case-insensitive), OR "Code: <code>" if user gave code.
+- Prefer a direct match by Name/Code/Barcode.
 - If a direct match exists:
   - Do NOT start with "Yes" or "No".
   - Return the best match as a short record:
-    "<Name> (Code: <Code>) — Type: <Product Type>"
-  - Optionally include up to 2 extra helpful facts if present (e.g. Primary/Secondary Voltage, Rated Power), but keep concise.
+    "<Name> (Code: <Code>) — Type: <Product Type> — Barcode: <Barcode>"
+    - If Code or Barcode is empty, omit that part.
+  - Optionally include up to 2 extra helpful facts if present (examples: Primary Voltage, Secondary Voltage, Rated Power Capacity, Frequency, Vector Group, Cooling Method).
   - Citations must include ONLY the chunk(s) you referenced (usually 1).
 - If no direct match exists:
   - Do NOT start with "Yes" or "No".
@@ -216,12 +225,11 @@ D) LOOKUP / SHOW REQUEST RULES (RETRIEVE A RECORD):
   - If unsure due to ambiguity, say "I don't know" and explain what is missing.
 
 A) SPECIFIC EXISTENCE CHECK RULES:
-- If SOURCES contains a Product record matching the user's name/code/barcode:
+- If SOURCES contains a direct match Product record by Name/Code/Barcode:
   - Answer must start with: "Yes —"
   - Then show the best match as a short record:
-    - Name
-    - Code (if present)
-    - Product Type (if present)
+    "<Name> (Code: <Code>) — Type: <Product Type> — Barcode: <Barcode>"
+    - If Code or Barcode is empty, omit that part.
   - Optionally include 1 extra supporting detail if helpful, but keep it concise.
   - Citations must include ONLY the chunk(s) you referenced (usually 1).
 - If no direct match:
@@ -236,11 +244,10 @@ B) BROAD CATEGORY RULES:
 - If none match, answer "No" and briefly say you couldn’t find products matching that category in SOURCES.
 - If more than 5 match, say: "Showing a few examples."
 
-MATCHING GUIDANCE (IMPORTANT):
-- Treat case-insensitive matches as matches.
-- If the user gives a product name, a chunk that contains a line like "Name: <that name>" is a direct match.
-- If the user gives a code, a chunk that contains "Code: <that code>" is a direct match.
-- Never answer "No" when a direct match exists in SOURCES.
+GROUNDING & CITATIONS:
+- grounded=true ONLY if your answer is directly supported by the specific Product chunks you cite.
+- citations MUST include ONLY the chunks you actually used in the answer (ideally 1–3, never all matches).
+- If you list multiple examples, cite the chunks for those examples only.
 
 STRICT OUTPUT RULES:
 - Return ONLY valid JSON matching the schema (no markdown, no code fences, no <thinking>, no JSON schema).
@@ -292,7 +299,7 @@ Return ONLY JSON in this schema:
     }
 
     // 2) ALWAYS RAG with the rewritten query
-    const matches = await this.rag.search(ragQuery, 10);
+    const matches = await this.rag.searchHybrid(ragQuery, 10);
 
     // 3) FILTER the matches
     let filteredMatches = matches;
@@ -314,8 +321,12 @@ Return ONLY JSON in this schema:
       const keep = new Set<number>((filter.keep_chunk_ids ?? []).map(Number));
       filteredMatches = matches.filter((m) => keep.has(Number(m.chunk_id)));
 
-      // Safety fallback: if the filter keeps nothing, keep top 1
-      if (!filteredMatches.length) filteredMatches = matches.slice(0, 1);
+      const isIdentifierQuery =
+        /barcode|code|look up|lookup|find|search|show me/i.test(message);
+
+      if (!filteredMatches.length) {
+        filteredMatches = isIdentifierQuery ? [] : matches.slice(0, 1);
+      }
     }
 
     // 4) FINAL ANSWER

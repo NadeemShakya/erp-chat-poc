@@ -131,4 +131,71 @@ export class RagService {
 
     return res.rows;
   }
+
+  // rag.service.ts (add near bottom)
+
+  private looksLikeIdentifier(q: string) {
+    const s = (q || '').trim();
+
+    // barcode: mostly digits, may contain leading zeros
+    const hasBarcode = /\bbarcode\b/i.test(s);
+    const digitToken = s.match(/\b\d{4,}\b/); // 4+ digits
+    const hasLikelyBarcode = hasBarcode && digitToken;
+
+    // code-like tokens: contains hyphen or colon or mixed letters+digits
+    const hasCodeWord = /\bcode\b/i.test(s);
+    const codeToken = s.match(/\b[a-z0-9]+[-:][a-z0-9\/-]+\b/i);
+    const hasLikelyCode = hasCodeWord || codeToken;
+
+    // If question mentions barcode/code explicitly or contains strong code token, treat as identifier
+    return Boolean(hasLikelyBarcode || hasLikelyCode);
+  }
+
+  private extractIdentifierTokens(q: string): string[] {
+    const s = (q || '').trim();
+
+    // Grab the number token (keeps leading zeros)
+    const nums = Array.from(s.matchAll(/\b\d{4,}\b/g)).map((m) => m[0]);
+
+    // Grab code-ish tokens (e.g. 89852-1423, PE: TX-..., HM-4567U8)
+    const codes = Array.from(s.matchAll(/\b[a-z0-9]+[-:][a-z0-9\/-]+\b/gi)).map(
+      (m) => m[0],
+    );
+
+    // Also keep the raw string (sometimes rewrite puts "Barcode: 09038")
+    const out = [...new Set([...nums, ...codes, s])].filter(Boolean);
+
+    return out.slice(0, 5); // keep small
+  }
+
+  async searchHybrid(query: string, limit = 10): Promise<RagRow[]> {
+    // If it's identifier-like, lexical should dominate
+    if (this.looksLikeIdentifier(query)) {
+      const tokens = this.extractIdentifierTokens(query);
+
+      // Run lexical for each token and merge
+      const lexicalResults: RagRow[] = [];
+      for (const t of tokens) {
+        const rows = await this.searchLexical(t, limit);
+        lexicalResults.push(...rows);
+        if (lexicalResults.length >= limit) break;
+      }
+
+      // If lexical finds enough, return it first
+      const dedup = new Map<number, RagRow>();
+      for (const r of lexicalResults) dedup.set(Number(r.chunk_id), r);
+
+      if (dedup.size >= Math.min(3, limit)) {
+        return Array.from(dedup.values()).slice(0, limit);
+      }
+
+      // Otherwise combine lexical + vector (fallback)
+      const vector = await this.searchVector(query, limit);
+      for (const r of vector) dedup.set(Number(r.chunk_id), r);
+      return Array.from(dedup.values()).slice(0, limit);
+    }
+
+    // Default: your current behavior (vector ranked)
+    return this.search(query, limit);
+  }
 }
