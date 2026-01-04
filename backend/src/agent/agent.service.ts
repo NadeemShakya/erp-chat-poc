@@ -19,6 +19,11 @@ const RagQuerySchema = z.object({
 });
 type RagQueryOutput = z.infer<typeof RagQuerySchema>;
 
+type TraceOpts = {
+  tags?: string[];
+  metadata?: Record<string, any>;
+};
+
 @Injectable()
 export class AgentService {
   constructor(
@@ -47,10 +52,6 @@ export class AgentService {
 
   /**
    * RAG rewrite prompt
-   * Goal: produce a query that matches your ingested raw_text format, NOT a natural sentence.
-   *
-   * Critical fix: Treat "Have we built X?" as "Does a Product record exist for X?"
-   * That should search for Name/Code/Product Type patterns.
    */
   private rewritePrompt() {
     return new PromptTemplate({
@@ -271,11 +272,6 @@ Return ONLY JSON in this schema:
     });
   }
 
-  /**
-   * V2: same rules, but slightly more user-friendly and conservative.
-   * - If broad/list query has matches, show examples (don’t just say “Yes”)
-   * - If “No”, be stricter: only “No” if there is no direct match in SOURCES.
-   */
   private finalAnswerPromptV2() {
     return new PromptTemplate({
       template: `
@@ -311,9 +307,6 @@ Return ONLY JSON in this schema:
   }
 
   private extractDirectMatchSignals(question: string, sourcesText: string) {
-    // Very lightweight: detect if user gave a barcode/code/name-like token
-    const q = question.toLowerCase();
-
     const codeLike = question
       .match(/code\s*[:\-]?\s*([A-Za-z0-9:\/\-\s]+)$/i)?.[1]
       ?.trim();
@@ -321,7 +314,6 @@ Return ONLY JSON in this schema:
       .match(/barcode\s*[:\-]?\s*([0-9A-Za-z\-]+)\b/i)?.[1]
       ?.trim();
 
-    // If sources already contain the exact Code:/Barcode: line, then “No” is invalid.
     const hasCodeInSources = codeLike
       ? sourcesText.toLowerCase().includes(`code: ${codeLike.toLowerCase()}`)
       : false;
@@ -332,8 +324,6 @@ Return ONLY JSON in this schema:
           .includes(`barcode: ${barcodeLike.toLowerCase()}`)
       : false;
 
-    // Also detect direct Name: match if question is basically "Do we have X" (single entity)
-    // This stays intentionally conservative (won't overfire).
     const possibleName =
       question.match(/do we have\s+(.+?)\??$/i)?.[1]?.trim() ||
       question.match(/have we built\s+(.+?)\??$/i)?.[1]?.trim() ||
@@ -357,20 +347,15 @@ Return ONLY JSON in this schema:
     const { out, filteredMatches, sourcesText, question } = params;
 
     let score = 0;
-
-    // Must have basic fields
     if (!out || typeof out.answer !== 'string') return -999;
 
-    // Grounded bonus
     if (out.grounded === true) score += 3;
     else score -= 1;
 
-    // Confidence sanity
     const conf = typeof out.confidence === 'number' ? out.confidence : 0;
     if (conf >= 0.9 && out.grounded !== true) score -= 2;
     if (conf >= 0.7) score += 1;
 
-    // Citation alignment: citations must reference only returned matches
     const matchIds = new Set(
       (filteredMatches ?? []).map((m) => String(m.chunk_id)),
     );
@@ -380,7 +365,6 @@ Return ONLY JSON in this schema:
     if (invalidCites.length) score -= 5;
     else if (citedIds.length) score += 1;
 
-    // “No” penalty if direct match exists in sources
     const ansLower = out.answer.toLowerCase();
     const saysNo =
       ansLower.startsWith('no') || ansLower.includes('couldn’t find');
@@ -392,10 +376,9 @@ Return ONLY JSON in this schema:
         signals.hasBarcodeInSources ||
         signals.hasNameInSources)
     ) {
-      score -= 10; // hard fail: it contradicted evidence
+      score -= 10;
     }
 
-    // Prefer answers that actually mention the matched product name/code for specific queries
     if (
       !saysNo &&
       (signals.hasCodeInSources ||
@@ -408,8 +391,18 @@ Return ONLY JSON in this schema:
     return score;
   }
 
-  async run(message: string): Promise<AnswerOutput> {
+  async run(message: string, trace?: TraceOpts): Promise<AnswerOutput> {
     const llm = this.lc.model;
+
+    // Shared LangSmith context (tags + metadata)
+    const baseRunConfig = {
+      tags: ['erp-poc', 'agent', 'rag', 'pdo', ...(trace?.tags ?? [])],
+      metadata: {
+        app: 'erp-chat-poc',
+        mode: 'agent-rag-only',
+        ...(trace?.metadata ?? {}),
+      },
+    };
 
     // 1) REWRITE query for RAG (with safe fallback)
     let ragQuery = message;
@@ -422,10 +415,17 @@ Return ONLY JSON in this schema:
         rewriteParser,
       ]);
 
-      const rewritten: RagQueryOutput = await rewriteChain.invoke({
-        question: message,
-        format_instructions: rewriteParser.getFormatInstructions(),
-      });
+      const rewritten: RagQueryOutput = await rewriteChain.invoke(
+        {
+          question: message,
+          format_instructions: rewriteParser.getFormatInstructions(),
+        },
+        {
+          ...baseRunConfig,
+          runName: 'rewrite_rag_query',
+          tags: [...baseRunConfig.tags, 'rewrite'],
+        },
+      );
 
       ragQuery = rewritten?.rag_query?.trim() || message;
     } catch {
@@ -446,11 +446,23 @@ Return ONLY JSON in this schema:
         filterParser,
       ]);
 
-      const filter: FilterOutput = await filterChain.invoke({
-        question: message,
-        sources: this.buildSourcesText(matches),
-        format_instructions: filterParser.getFormatInstructions(),
-      });
+      const filter: FilterOutput = await filterChain.invoke(
+        {
+          question: message,
+          sources: this.buildSourcesText(matches),
+          format_instructions: filterParser.getFormatInstructions(),
+        },
+        {
+          ...baseRunConfig,
+          runName: 'filter_rag_matches',
+          tags: [...baseRunConfig.tags, 'filter'],
+          metadata: {
+            ...baseRunConfig.metadata,
+            ragQuery,
+            candidates: matches.length,
+          },
+        },
+      );
 
       const keep = new Set<number>((filter.keep_chunk_ids ?? []).map(Number));
       filteredMatches = matches.filter((m) => keep.has(Number(m.chunk_id)));
@@ -469,7 +481,6 @@ Return ONLY JSON in this schema:
     const sourcesText = this.buildSourcesText(filteredMatches);
     const sqlResultText = this.safeJsonStringify([]);
 
-    // Run both prompts
     const chainV1 = RunnableSequence.from([
       this.finalAnswerPromptV1(),
       llm,
@@ -482,21 +493,44 @@ Return ONLY JSON in this schema:
     ]);
 
     const [out1, out2] = await Promise.all([
-      chainV1.invoke({
-        question: message,
-        sql_result: sqlResultText,
-        sources: sourcesText,
-        format_instructions: answerParser.getFormatInstructions(),
-      }),
-      chainV2.invoke({
-        question: message,
-        sql_result: sqlResultText,
-        sources: sourcesText,
-        format_instructions: answerParser.getFormatInstructions(),
-      }),
+      chainV1.invoke(
+        {
+          question: message,
+          sql_result: sqlResultText,
+          sources: sourcesText,
+          format_instructions: answerParser.getFormatInstructions(),
+        },
+        {
+          ...baseRunConfig,
+          runName: 'final_answer_v1',
+          tags: [...baseRunConfig.tags, 'final', 'v1'],
+          metadata: {
+            ...baseRunConfig.metadata,
+            ragQuery,
+            filtered: filteredMatches.length,
+          },
+        },
+      ),
+      chainV2.invoke(
+        {
+          question: message,
+          sql_result: sqlResultText,
+          sources: sourcesText,
+          format_instructions: answerParser.getFormatInstructions(),
+        },
+        {
+          ...baseRunConfig,
+          runName: 'final_answer_v2',
+          tags: [...baseRunConfig.tags, 'final', 'v2'],
+          metadata: {
+            ...baseRunConfig.metadata,
+            ragQuery,
+            filtered: filteredMatches.length,
+          },
+        },
+      ),
     ]);
 
-    // Score and select winner
     const score1 = this.scoreAnswer({
       out: out1,
       filteredMatches,
@@ -515,7 +549,6 @@ Return ONLY JSON in this schema:
         ? { out: out2, version: 'v2', score: score2 }
         : { out: out1, version: 'v1', score: score1 };
 
-    // Optional logging (helps debugging/observability)
     console.log('PDO duel:', {
       question: message,
       score1,
@@ -523,7 +556,6 @@ Return ONLY JSON in this schema:
       winner: winner.version,
     });
 
-    // Normalize citations to retrieved matches only
     const safeCitations = (filteredMatches ?? []).map((m) => ({
       chunk_id: m.chunk_id,
       title: m.title,
