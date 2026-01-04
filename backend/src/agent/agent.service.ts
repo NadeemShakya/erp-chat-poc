@@ -5,7 +5,6 @@ import { Injectable } from '@nestjs/common';
 import { LangchainService } from 'src/ai/langchain.service';
 import { AnswerSchema, type AnswerOutput } from 'src/ai/schemas';
 import { RagService } from 'src/rag/rag.service';
-import { SqlService } from 'src/sql/sql.service';
 import { z } from 'zod';
 
 // Filter schema: only return ids of chunks that actually support the answer
@@ -24,7 +23,6 @@ type RagQueryOutput = z.infer<typeof RagQuerySchema>;
 export class AgentService {
   constructor(
     private readonly lc: LangchainService,
-    private readonly sql: SqlService, // unused for now, ok to keep
     private readonly rag: RagService,
   ) {}
 

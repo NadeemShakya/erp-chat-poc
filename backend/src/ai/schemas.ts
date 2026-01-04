@@ -1,12 +1,5 @@
 import { z } from 'zod';
 
-export const RouterSchema = z.object({
-  route: z.enum(['sql', 'rag', 'agent']).default('rag'),
-  sql: z.string().optional(), // ✅ no null
-});
-
-export type RouterOutput = z.infer<typeof RouterSchema>;
-
 export const AnswerSchema = z.object({
   answer: z.string(),
   matches: z

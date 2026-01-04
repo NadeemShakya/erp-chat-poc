@@ -49,7 +49,6 @@ export class SqlService {
   async query(sql: string) {
     assertReadOnlySql(sql);
 
-    // ✅ auto-repair model hallucinations
     sql = this.normalizeSql(sql);
 
     const client = await this.pool.connect();

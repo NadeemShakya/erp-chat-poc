@@ -29,7 +29,6 @@ export class IngestService {
 
   private readonly bedrock = new BedrockRuntimeClient({ region: this.region });
 
-  // -------------------- Helpers (copied from your mjs) --------------------
   private chunkText(text: string, maxChars = 1400, overlap = 200) {
     const cleaned = (text || '').replace(/\r\n/g, '\n').trim();
     if (!cleaned) return [];
@@ -72,7 +71,6 @@ export class IngestService {
     }
   }
 
-  // -------------------- Bedrock embeddings (copied from your mjs) --------------------
   private async titanEmbed(text: string): Promise<number[]> {
     const cmd = new InvokeModelCommand({
       modelId: this.embedModel,
@@ -93,7 +91,6 @@ export class IngestService {
     return body.embedding;
   }
 
-  // -------------------- DB write ops (copied from your mjs) --------------------
   private async getOrUpsertDocument(params: {
     doc_type: 'product' | 'material';
     entity_table: string;
@@ -165,7 +162,6 @@ export class IngestService {
     return chunks.length;
   }
 
-  // -------------------- Main ingestion (API version of your mjs) --------------------
   async ingestProductsMaterials(opts: IngestOpts) {
     const { tenantSchema, rebuild } = opts;
     this.assertSafeSchema(tenantSchema);
