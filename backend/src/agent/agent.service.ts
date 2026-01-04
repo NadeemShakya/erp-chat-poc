@@ -9,15 +9,13 @@ import { AnswerSchema, type AnswerOutput } from 'src/ai/schemas';
 import { SqlService } from 'sql/sql.service';
 import { RagService } from 'rag/rag.service';
 
-// (Keep your existing PlanSchema if you want, but we won't use it in this mode)
-
 // Filter schema: only return ids of chunks that actually support the answer
 const FilterSchema = z.object({
   keep_chunk_ids: z.array(z.number()).max(8).default([]),
 });
 type FilterOutput = z.infer<typeof FilterSchema>;
 
-// ✅ NEW: rewrite schema for RAG query
+// Rewrite schema for RAG query
 const RagQuerySchema = z.object({
   rag_query: z.string().min(1),
 });
@@ -50,24 +48,40 @@ export class AgentService {
     }
   }
 
-  // ✅ NEW: RAG rewrite prompt (f-string safe: no unescaped { } examples)
+  /**
+   * RAG rewrite prompt
+   * Goal: produce a query that matches your ingested raw_text format, NOT a natural sentence.
+   *
+   * Critical fix: Treat "Have we built X?" as "Does a Product record exist for X?"
+   * That should search for Name/Code/Product Type patterns.
+   */
   private rewritePrompt() {
     return new PromptTemplate({
       template: `
 You are rewriting a user question into a compact search query for hybrid RAG over Product documents.
 
 The RAG index includes ALL product fields ingested into raw_text, including:
-- product name
-- product code
-- barcode
-- product type
-- description
-- attributes (attribute name + value + unit)
+- Entity: Product
+- Name:
+- Code:
+- Barcode:
+- Product Type:
+- Description:
+- Attributes lines like: "- <Attribute Name> (<Unit>): <Value>"
+
+IMPORTANT INTERPRETATION RULE:
+If the user asks "Have we built X?" or "Have we built X before?" interpret it as:
+"Does our ERP have a Product record for X (by name/code/type/attributes)?"
+So your rewrite should search for product records, not manufacturing history.
 
 Rewrite rules:
 - Output a short keyword/spec query (not a sentence).
-- Include key entity/type words (e.g. transformer, insulation material).
-- If a numeric/unit value appears, include common variants:
+- Prefer the raw_text field labels when possible: "Name:", "Code:", "Product Type:", "Attributes:".
+- If the user mentions a specific named product (e.g. Himalayan Mango), include:
+  - "Name: <name>" and also the plain name.
+- If the user asks by type/category (e.g. Distribution Transformer), include:
+  - "Product Type: <type>" and also the plain type.
+- If numeric/unit appears, include common variants:
   - 11kV -> "11kV" OR "11 kV" OR "11 kilovolt" OR "11000 V"
   - 200 Hz -> "200 Hz" OR "200Hz" OR "200 Hertz"
 - If the user implies an attribute, add likely attribute label words:
@@ -84,6 +98,10 @@ User question:
     });
   }
 
+  /**
+   * Filter prompt
+   * Small improvement: keep chunks that clearly represent a Product record and match by Name/Code/Type/Attribute.
+   */
   private filterPrompt() {
     return new PromptTemplate({
       template: `
@@ -95,6 +113,9 @@ Reject chunks that are unrelated, generic, or do not mention relevant properties
 
 Rules:
 - Keep at most 8 chunk_ids.
+- Prefer chunks that clearly contain a Product record:
+  - Contains "Entity: Product"
+  - And contains matching "Name:", "Code:", "Product Type:" or relevant attribute lines.
 - Keep a chunk ONLY if it contains clear evidence relevant to the question.
 - Return ONLY JSON matching the schema.
 - No markdown, no code fences, no extra keys.
@@ -117,8 +138,65 @@ Return JSON:
       template: `
 You are an ERP assistant.
 
-Use ONLY the information in SQL_RESULT and SOURCES.
-If you cannot answer, say you don't know.
+DEFINITION:
+- "Do we have X?" / "Have we built X?" means: "Does our ERP have Product records matching X (by name/code/type/attributes)?"
+
+You MUST use ONLY SOURCES and SQL_RESULT (SQL_RESULT is usually empty in this mode).
+
+CLASSIFY THE QUESTION (pick exactly one):
+C) DETAIL request: the user asks for attributes/specs/details of a specific product
+   (examples: "attributes", "specs", "specifications", "properties", "details", "what are the attributes", "provide me the attributes").
+A) SPECIFIC lookup: the user provides a specific product name/code/barcode and asks if it exists.
+B) BROAD category: the user asks for a category/type (e.g. "Do we have Transformers?").
+
+PRIORITY:
+- If it looks like a DETAIL request, ALWAYS treat it as C even if the product name is specific.
+
+HOW TO ANSWER:
+
+C) DETAIL REQUEST RULES (ATTRIBUTES/SPECS):
+- First, identify the best matching Product record in SOURCES.
+  A direct match contains:
+  - "Entity: Product" AND
+  - "Name: <product name>" (case-insensitive), OR "Code: <code>" if user gave code.
+- If a direct match exists:
+  - Answer must start with: "Here are the attributes for <Name> (Code: <Code>):"
+  - Then list ALL attribute lines found under "Attributes:" exactly as they appear in the source.
+    - Only list lines that start with "- " under the Attributes section.
+  - If the Attributes section is "- (none)" or empty:
+    - Say: "No attributes are recorded for this product in the ERP."
+  - Citations must include ONLY the chunk(s) you used (usually 1).
+- If no direct match exists:
+  - Answer must start with: "I don't know —"
+  - Then say you couldn't find a product record matching the requested name/code in SOURCES.
+  - If there are close matches, list up to 3 (Name + Code + Type).
+
+A) SPECIFIC LOOKUP RULES:
+- If SOURCES contains a Product record matching the user's name/code/barcode:
+  - Answer must start with: "Yes —"
+  - Then show the best match as a short record:
+    - Name
+    - Code (if present)
+    - Product Type (if present)
+  - Optionally include 1 extra supporting detail if helpful, but keep it concise.
+  - Citations must include ONLY the chunk(s) you referenced (usually 1).
+- If no direct match:
+  - Answer must start with: "No —"
+  - If there are close matches in SOURCES, say: "Closest matches I found:" and list up to 3 (Name + Code + Type).
+  - Set grounded=true only if SOURCES actually support the "No" (i.e. no direct match appears in SOURCES).
+  - If unsure due to ambiguity, say "I don't know" and explain what is missing.
+
+B) BROAD CATEGORY RULES:
+- If at least one matching Product exists in SOURCES, answer "Yes" and provide up to 5 examples:
+  "<Name> (Code: <Code>) — Type: <Product Type>"
+- If none match, answer "No" and briefly say you couldn’t find products matching that category in SOURCES.
+- If more than 5 match, say: "Showing a few examples."
+
+MATCHING GUIDANCE (IMPORTANT):
+- Treat case-insensitive matches as matches.
+- If the user gives a product name, a chunk that contains a line like "Name: <that name>" is a direct match.
+- If the user gives a code, a chunk that contains "Code: <that code>" is a direct match.
+- Never answer "No" when a direct match exists in SOURCES.
 
 STRICT OUTPUT RULES:
 - Return ONLY valid JSON matching the schema (no markdown, no code fences, no <thinking>, no JSON schema).
@@ -148,7 +226,7 @@ Return ONLY JSON in this schema:
   async run(message: string): Promise<AnswerOutput> {
     const llm = this.lc.model;
 
-    // 1) ✅ REWRITE query for RAG (with safe fallback)
+    // 1) REWRITE query for RAG (with safe fallback)
     let ragQuery = message;
     try {
       const rewriteParser =
@@ -165,8 +243,7 @@ Return ONLY JSON in this schema:
       });
 
       ragQuery = rewritten?.rag_query?.trim() || message;
-    } catch (e) {
-      // fallback to raw user message
+    } catch {
       ragQuery = message;
     }
 
@@ -193,6 +270,7 @@ Return ONLY JSON in this schema:
       const keep = new Set<number>((filter.keep_chunk_ids ?? []).map(Number));
       filteredMatches = matches.filter((m) => keep.has(Number(m.chunk_id)));
 
+      // Safety fallback: if the filter keeps nothing, keep top 1
       if (!filteredMatches.length) filteredMatches = matches.slice(0, 1);
     }
 
@@ -211,6 +289,7 @@ Return ONLY JSON in this schema:
       format_instructions: answerParser.getFormatInstructions(),
     });
 
+    // Only cite chunks we actually returned
     const safeCitations = (filteredMatches ?? []).map((m) => ({
       chunk_id: m.chunk_id,
       title: m.title,
