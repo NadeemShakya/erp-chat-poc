@@ -1,5 +1,4 @@
-import * as React from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import AppShell from "@/components/layout/AppShell";
 import ChatPage from "@/pages/ChatPage";
